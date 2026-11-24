@@ -1,0 +1,72 @@
+name: build-scan-push
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_VERSION: "0.76.2"   # актуальна безпечна версія (НЕ 0.69.4)
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ naive, hardened ]
+    env:
+      IMG: ${{ vars.ACR_LOGIN_SERVER }}/demo-app:${{ matrix.variant }}-${{ github.sha }}
+      IMG_LATEST: ${{ vars.ACR_LOGIN_SERVER }}/demo-app:${{ matrix.variant }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Trivy (pinned version + SHA-256 check)
+        run: |
+          V="${TRIVY_VERSION}"
+          BASE="https://github.com/aquasecurity/trivy/releases/download/v${V}"
+          curl -sSLO "${BASE}/trivy_${V}_Linux-64bit.tar.gz"
+          curl -sSLO "${BASE}/trivy_${V}_checksums.txt"
+          grep " trivy_${V}_Linux-64bit.tar.gz$" "trivy_${V}_checksums.txt" | sha256sum -c -
+          tar -xzf "trivy_${V}_Linux-64bit.tar.gz" trivy
+          sudo mv trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Build image
+        run: docker build -t "$IMG" -t "$IMG_LATEST" -f "${{ matrix.variant }}/Dockerfile" .
+
+      - name: Trivy report
+        run: |
+          R="report-${{ matrix.variant }}.json"
+          trivy image --scanners vuln --format json -o "$R" "$IMG"
+          trivy image --scanners vuln --format table -o "report-${{ matrix.variant }}.txt" "$IMG"
+          {
+            echo "### Trivy: ${{ matrix.variant }}"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            jq -r '[.Results[]?.Vulnerabilities[]?.Severity] | group_by(.) | map("| \(.[0]) | \(length) |") | .[]' "$R"
+            echo "| Python libs | $(jq '[.Results[]? | select(.Class=="lang-pkgs") | .Vulnerabilities[]?] | length' "$R") |"
+            echo "| TOTAL | $(jq '[.Results[]?.Vulnerabilities[]?] | length' "$R") |"
+            echo ""
+            echo "Process user: $(docker run --rm --entrypoint whoami "$IMG")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.variant }}
+          path: report-${{ matrix.variant }}.*
+
+      - name: Security gate (no fixable CRITICAL)
+        run: trivy image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 "$IMG"
+
+      - name: Push to Azure Container Registry
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ vars.ACR_LOGIN_SERVER }}" -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          docker push "$IMG"
+          docker push "$IMG_LATEST"
